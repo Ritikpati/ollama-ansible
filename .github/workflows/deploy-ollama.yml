@@ -62,6 +62,7 @@ jobs:
         run: |
           STATE=present; [ "$ACTION" = "destroy" ] && STATE=absent
           ansible-playbook playbooks/provision.yml \
+            -i localhost, \
             -e server_name="$SERVER_NAME" \
             -e server_count="$SERVER_COUNT" \
             -e instance_type="$INSTANCE_TYPE" \
