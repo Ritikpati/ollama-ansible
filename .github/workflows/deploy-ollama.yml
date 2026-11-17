@@ -1,0 +1,110 @@
+name: Create Ollama servers
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "deploy = create servers + install Ollama, destroy = terminate them"
+        type: choice
+        options: [deploy, destroy]
+        default: deploy
+      server_name:
+        description: "Server name (EC2 Name tag)"
+        default: "ollama"
+        required: true
+      server_count:
+        description: "Number of servers"
+        default: "8"
+        required: true
+      instance_type:
+        description: "EC2 instance type"
+        default: "t3.xlarge"
+        required: true
+      key_name:
+        description: "Existing EC2 key pair name (matches SSH_PRIVATE_KEY secret)"
+        required: true
+      models:
+        description: "Models to pull, comma separated (e.g. llama3.2,qwen2.5:7b)"
+        default: ""
+        required: false
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  ollama:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible and AWS libs
+        run: |
+          pip install ansible boto3 botocore
+          ansible-galaxy collection install -r requirements.yml
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create / destroy servers
+        env:
+          ACTION: ${{ inputs.action }}
+          SERVER_NAME: ${{ inputs.server_name }}
+          SERVER_COUNT: ${{ inputs.server_count }}
+          INSTANCE_TYPE: ${{ inputs.instance_type }}
+          KEY_NAME: ${{ inputs.key_name }}
+        run: |
+          STATE=present; [ "$ACTION" = "destroy" ] && STATE=absent
+          ansible-playbook playbooks/provision.yml \
+            -e server_name="$SERVER_NAME" \
+            -e server_count="$SERVER_COUNT" \
+            -e instance_type="$INSTANCE_TYPE" \
+            -e key_name="$KEY_NAME" \
+            -e server_state="$STATE"
+
+      - name: Write SSH key
+        if: inputs.action == 'deploy'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -m 600 /dev/null ~/.ssh_key
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh_key
+
+      - name: Build inventory (finds the new servers by Name tag)
+        if: inputs.action == 'deploy'
+        env:
+          SERVER_NAME: ${{ inputs.server_name }}
+        run: |
+          cat > inventory.aws_ec2.yml <<INV
+          plugin: amazon.aws.aws_ec2
+          regions:
+            - ${AWS_REGION}
+          filters:
+            "tag:Name": "${SERVER_NAME}"
+            instance-state-name: running
+          hostnames:
+            - ip-address
+          INV
+          ansible-inventory -i inventory.aws_ec2.yml --graph
+
+      - name: Install Ollama on every server
+        if: inputs.action == 'deploy'
+        env:
+          MODELS: ${{ inputs.models }}
+        run: |
+          MODELS_JSON=$(python3 -c "import json,os; print(json.dumps([m.strip() for m in os.environ['MODELS'].split(',') if m.strip()]))")
+          ansible-playbook playbooks/ollama.yml \
+            -i inventory.aws_ec2.yml \
+            -u ubuntu \
+            --private-key ~/.ssh_key \
+            -e "{\"ollama_models\": $MODELS_JSON}"
+
+      - name: Cleanup key
+        if: always()
+        run: rm -f ~/.ssh_key

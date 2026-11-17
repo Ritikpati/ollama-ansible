@@ -1,0 +1,99 @@
+---
+- name: Install and run Ollama on all servers
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    # 127.0.0.1 = local only (safe). Use 0.0.0.0:11434 to expose (put a firewall/SG in front!)
+    ollama_host: "127.0.0.1:11434"
+    ollama_models: []          # e.g. ["llama3.2", "qwen2.5:7b"]
+
+  tasks:
+    - name: Wait for SSH on freshly created servers
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 300
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Wait for cloud-init to finish (avoids apt lock)
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: [curl, zstd]
+        state: present
+        update_cache: true
+        lock_timeout: 120
+      when: ansible_os_family == 'Debian'
+
+    - name: Install prerequisites (non-Debian)
+      ansible.builtin.package:
+        name: [curl, zstd]
+        state: present
+      when: ansible_os_family != 'Debian'
+
+    - name: Check if Ollama is already installed
+      ansible.builtin.command: which ollama
+      register: ollama_bin
+      changed_when: false
+      failed_when: false
+
+    - name: Download Ollama install script
+      ansible.builtin.get_url:
+        url: https://ollama.com/install.sh
+        dest: /tmp/ollama-install.sh
+        mode: "0755"
+      when: ollama_bin.rc != 0
+
+    - name: Run Ollama install script
+      ansible.builtin.command: sh /tmp/ollama-install.sh
+      when: ollama_bin.rc != 0
+
+    - name: Create systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/ollama.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Configure Ollama bind address
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ollama.service.d/override.conf
+        mode: "0644"
+        content: |
+          [Service]
+          Environment="OLLAMA_HOST={{ ollama_host }}"
+      notify: Restart ollama
+
+    - name: Enable and start Ollama
+      ansible.builtin.systemd:
+        name: ollama
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Flush handlers so config is applied before pulling models
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for Ollama API
+      ansible.builtin.wait_for:
+        host: "{{ ollama_host.split(':')[0] | replace('0.0.0.0', '127.0.0.1') }}"
+        port: "{{ ollama_host.split(':')[1] | int }}"
+        timeout: 60
+
+    - name: Pull models
+      ansible.builtin.command: "ollama pull {{ item }}"
+      environment:
+        OLLAMA_HOST: "{{ ollama_host | replace('0.0.0.0', '127.0.0.1') }}"
+      loop: "{{ ollama_models }}"
+      changed_when: true
+
+  handlers:
+    - name: Restart ollama
+      ansible.builtin.systemd:
+        name: ollama
+        state: restarted
+        daemon_reload: true
